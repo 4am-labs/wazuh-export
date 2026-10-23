@@ -6,8 +6,8 @@ Synthetic data only. The real wazuh-db (4.14.8, src/wazuh_db/wdb_parser.c) answe
 cut short with nothing to say so; a failure is "err <text>". Each row is a JSON object with NULL
 columns left out (wdb.c, wdb_exec_row_stmt_multi_column). This fake does the same on SQLite in
 memory, with the agent table exactly as schema_global.sql 13 to 43 defines it and sync_info as
-schema_agents.sql 456 to 464 defines it; the inventory tables carry only the columns the script
-reads, plus a name.
+schema_agents.sql 456 to 464 defines it; the inventory tables carry a few columns each, since the
+script reads them whole whatever their columns.
 """
 
 import json
@@ -69,6 +69,8 @@ CREATE TABLE sys_programs (scan_time TEXT, name TEXT);
 CREATE TABLE sys_hotfixes (scan_time TEXT, hotfix TEXT);
 CREATE TABLE sys_hwinfo (scan_time TEXT, cpu_name TEXT);
 CREATE TABLE sys_netiface (scan_time TEXT, name TEXT);
+CREATE TABLE sys_netaddr (iface TEXT, address TEXT);
+CREATE TABLE sys_netproto (iface TEXT, type TEXT);
 """
 
 COMPONENTS = ("fim", "syscollector-packages", "syscollector-hotfixes", "syscollector-osinfo",
@@ -118,6 +120,10 @@ class FakeWazuhDb:
             for p in range(3):
                 db.execute("INSERT INTO sys_programs VALUES (?, ?)",
                            ("2026/10/2%d 10:00:00" % p, "pkg-%d" % p))
+            db.execute("INSERT INTO sys_hwinfo VALUES ('2026/10/20 10:00:00', 'Synthetic CPU')")
+            db.execute("INSERT INTO sys_netiface VALUES ('2026/10/20 10:00:00', 'eth0')")
+            db.execute("INSERT INTO sys_netaddr VALUES ('eth0', '10.0.0.%d')" % n)
+            db.execute("INSERT INTO sys_netproto VALUES ('eth0', 'ipv4')")
             db.commit()
             self.agent_dbs[agent] = db
             with open(os.path.join(self.db_dir, agent + ".db"), "wb"):

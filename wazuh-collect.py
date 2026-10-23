@@ -3,8 +3,8 @@
 
 Run it as root on each Wazuh manager node, with the manager's own Python:
 
-    /var/ossec/framework/python/bin/python3 -I wazuh-collect.py --send TOKEN \\
-        [--user NAME] [--url https://INDEXER:9200] [--ca-file CA.pem] [--out-dir DIR]
+    /var/ossec/framework/python/bin/python3 -I wazuh-collect.py --send TOKEN [--out-dir DIR] \\
+        [--url https://INDEXER:9200] [--ca-file CA.pem] [--user NAME]
 
 TOKEN is the upload token that came with this script. It is good for one upload, to the one
 address below, until it expires. Without --send the package is made and left on this host, and
@@ -22,6 +22,15 @@ When this host is a Wazuh manager (it has the wazuh-db socket /var/ossec/queue/d
         block, copied as it stands.
     /var/ossec/VERSION.json
         The manager's version.
+    /etc/wazuh-indexer/certs/admin.pem and admin-key.pem
+        The indexer's own admin certificate and key, present where the indexer runs on this host
+        (an all-in-one installation). The script authenticates to the indexer with them, so no
+        account has to be created and no password typed. Python's TLS library reads them in
+        place; their contents are never copied, logged, packaged or sent. The certificate
+        permits anything on the indexer, so what the script does with it is bounded by
+        ALLOWED_REQUESTS below: the reads listed here and nothing else. Where they are not on
+        this host, the script stops before collecting anything and sends nothing, unless --user
+        names an indexer account, whose password is then asked for at a hidden prompt.
     /var/ossec/logs/ossec.log and the rotated logs under /var/ossec/logs/ossec/
         Only the lines the vulnerability scanner wrote (those carrying
         "wazuh-modulesd:vulnerability-scanner"): feed updates and scans.
@@ -31,23 +40,28 @@ When this host is a Wazuh manager (it has the wazuh-db socket /var/ossec/queue/d
         addresses, OS fields, agent version, manager and node, registration time, last
         keep-alive, connection status, disconnection time and groups. Never the agent's key.
         For every agent database on this node: its sync_info table (when each inventory
-        component last synchronised with the manager), and the newest scan_time and the row
-        count of its OS, packages, hotfixes, hardware and network interface tables. No rows of
-        those tables.
+        component last synchronised with the manager); every row of its OS, packages,
+        hotfixes, hardware and network tables (sys_osinfo, sys_programs, sys_hotfixes,
+        sys_hwinfo, sys_netiface, sys_netaddr, sys_netproto), which Wazuh before 4.13 never
+        puts in the indexer; and the newest scan_time and row count of the first five.
 
 On the master, a standalone manager, or a host that is not a manager: every document of six
-index patterns of the Wazuh indexer, through the read requests in ALLOWED_REQUESTS below and
-nothing else:
+data sets of the Wazuh indexer, through the read requests in ALLOWED_REQUESTS below and nothing
+else:
 
     wazuh-states-vulnerabilities-*        wazuh-states-inventory-system-*
     wazuh-states-inventory-packages-*     wazuh-states-inventory-hotfixes-*
     wazuh-states-inventory-networks-*     wazuh-states-inventory-hardware-*
 
+On a manager, each data set's index is named after the cluster, or after this host where there
+is no cluster, and only the index of the current name is read. Indices left under the same
+patterns by an earlier name are listed in the manifest by name and document count, not read.
+
 A worker node (cluster enabled, node_type worker) reads only its own agent databases and does
 not contact the indexer; the master's run covers the rest. Run the same command on every node.
 
-The indexer password is asked for at a hidden prompt and held in memory for the run only. It is
-never written to the terminal, the log or any file.
+With --user, the indexer password is asked for at a hidden prompt and held in memory for the run
+only. It is never written to the terminal, the log or any file.
 
 What it writes, in --out-dir (default: the current directory), each file readable by root only
 ----------------------------------------------------------------------------------------------
@@ -62,6 +76,7 @@ What it writes, in --out-dir (default: the current directory), each file readabl
         manager/agents.json                the agent table columns above (master, standalone)
         manager/sync_info.json             sync_info per agent database on this node
         manager/scan_times.json            newest scan_time and row count per table and agent
+        manager/inventory.json             every row of the seven inventory tables, per agent
         manager/vulnerability-detection.conf    the ossec.conf block named above
         manager/vulnerability-scanner.log  the scanner's log lines, each with its file
         manifest.json                      per item: rows, reconciliation, SHA-256; the script's
@@ -146,11 +161,14 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 # Sent with every request. Cloudflare, in front of the receiver, refuses urllib's default.
 USER_AGENT = "wazuh-collect/" + VERSION
 
 WAZUH_DIR = "/var/ossec"
+# The indexer's own admin certificate, where the indexer runs on this host (all-in-one).
+INDEXER_ADMIN_CERT = "/etc/wazuh-indexer/certs/admin.pem"
+INDEXER_ADMIN_KEY = "/etc/wazuh-indexer/certs/admin-key.pem"
 UPLOAD_URL = "https://upload.4amlabs.com/v1/upload"
 MAX_UPLOAD_BYTES = 95000000
 
@@ -197,6 +215,11 @@ PATTERNS = (
 # A pattern matching no index leaves the package INCOMPLETE only for these; the other four
 # indices may not exist on a manager whose agents report no such inventory.
 REQUIRED_PATTERNS = ("wazuh-states-vulnerabilities-*", "wazuh-states-inventory-packages-*")
+# On a manager the inventory is read whole from wazuh-db, so only the vulnerabilities are
+# required of the indexer; Wazuh before 4.13 indexes no inventory at all.
+MANAGER_REQUIRED_PATTERNS = ("wazuh-states-vulnerabilities-*",)
+# The name a data set's index ends with: the cluster's, or the host's where there is no cluster.
+INDEX_SUFFIX = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 CSV_ENTRY = "wazuh-states.csv"
 SOURCE_PREFIX = "_source."
 KEEP_ALIVE = "1m"
@@ -241,6 +264,8 @@ AGENT_COLUMNS = ("id", "name", "ip", "register_ip", "os_name", "os_version", "os
 SYNC_COLUMNS = ("component", "last_attempt", "last_completion", "n_attempts", "n_completions",
                 "last_manager_checksum", "last_agent_checksum")
 SCAN_TABLES = ("sys_osinfo", "sys_programs", "sys_hotfixes", "sys_hwinfo", "sys_netiface")
+# Read whole: the inventory, which Wazuh before 4.13 never puts in the indexer.
+INVENTORY_TABLES = SCAN_TABLES + ("sys_netaddr", "sys_netproto")
 
 GLOBAL_COUNT = "global sql SELECT COUNT(*) AS n FROM agent"
 GLOBAL_PAGE = ("global sql SELECT " + ", ".join(AGENT_COLUMNS)
@@ -249,15 +274,21 @@ SYNC_COUNT = "agent {agent} sql SELECT COUNT(*) AS n FROM sync_info"
 SYNC_PAGE = ("agent {agent} sql SELECT " + ", ".join(SYNC_COLUMNS)
              + " FROM sync_info ORDER BY component LIMIT {limit} OFFSET {offset}")
 SCAN_TIME = "agent {agent} sql SELECT MAX(scan_time) AS max_scan_time, COUNT(*) AS n FROM {table}"
+INVENTORY_COUNT = "agent {agent} sql SELECT COUNT(*) AS n FROM {inventory}"
+# Every column: the inventory tables hold no key or secret, and their columns differ by release.
+INVENTORY_PAGE = ("agent {agent} sql SELECT rowid AS row_id, * FROM {inventory} ORDER BY rowid "
+                  "LIMIT {limit} OFFSET {offset}")
 
 # Every statement this script sends to wazuh-db. Nothing else is ever sent.
-WDB_STATEMENTS = (GLOBAL_COUNT, GLOBAL_PAGE, SYNC_COUNT, SYNC_PAGE, SCAN_TIME)
+WDB_STATEMENTS = (GLOBAL_COUNT, GLOBAL_PAGE, SYNC_COUNT, SYNC_PAGE, SCAN_TIME, INVENTORY_COUNT,
+                  INVENTORY_PAGE)
 
 _PLACEHOLDERS = {
     "agent": "[0-9]{3,}",
     "limit": "[1-9][0-9]*",
     "offset": "[0-9]+",
     "table": "(?:%s)" % "|".join(SCAN_TABLES),
+    "inventory": "(?:%s)" % "|".join(INVENTORY_TABLES),
 }
 
 
@@ -451,13 +482,17 @@ def _quote(pattern):
 
 
 _PATTERN_ALTERNATIVES = "|".join(re.escape(_quote(p)) for _, p in PATTERNS)
+# One data set's index by its exact name: a pattern with a name in place of its "*".
+_INDEX_ALTERNATIVES = "(?:%s)[A-Za-z0-9._-]{1,128}" % "|".join(
+    re.escape(_quote(p[:-1])) for _, p in PATTERNS)
+_TARGETS = "(?:%s|%s)" % (_PATTERN_ALTERNATIVES, _INDEX_ALTERNATIVES)
 
 # (method, path, the exact set of query parameters). Nothing else is ever sent to the indexer.
 ALLOWED_REQUESTS = (
     ("GET", re.compile(r"^/$"), frozenset()),
     ("GET", re.compile(r"^/(?:%s)/_mapping$" % _PATTERN_ALTERNATIVES), frozenset()),
-    ("GET", re.compile(r"^/(?:%s)/_count$" % _PATTERN_ALTERNATIVES), frozenset()),
-    ("POST", re.compile(r"^/(?:%s)/_search$" % _PATTERN_ALTERNATIVES), frozenset({"scroll"})),
+    ("GET", re.compile(r"^/%s/_count$" % _TARGETS), frozenset()),
+    ("POST", re.compile(r"^/%s/_search$" % _TARGETS), frozenset({"scroll"})),
     ("POST", re.compile(r"^/_search/scroll$"), frozenset()),
     ("DELETE", re.compile(r"^/_search/scroll$"), frozenset()),
 )
@@ -510,7 +545,9 @@ class Log:
             self._fh = None
 
 
-def tls_context(ca_file):
+def tls_context(ca_file, client_cert=None):
+    """A verifying context; with client_cert, a (certificate, key) pair to present, read by the
+    TLS library in place."""
     context = ssl.create_default_context(cafile=ca_file)
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED
@@ -518,6 +555,8 @@ def tls_context(ca_file):
         context.minimum_version = ssl.TLSVersion.TLSv1_2
     else:  # Python 3.6
         context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+    if client_cert:
+        context.load_cert_chain(*client_cert)
     return context
 
 
@@ -549,12 +588,18 @@ def _opener(context):
 
 
 class Indexer:
-    def __init__(self, base_url, ca_file, user, password, timeout=TIMEOUT_SECONDS):
+    """The indexer, as an account (user and password) or with a client certificate."""
+
+    def __init__(self, base_url, ca_file, user, password, timeout=TIMEOUT_SECONDS,
+                 client_cert=None):
         self.base_url = base_url
         self.timeout = timeout
-        token = base64.b64encode(("%s:%s" % (user, password)).encode("utf-8")).decode("ascii")
-        self._authorization = "Basic " + token
-        self._opener = _opener(tls_context(ca_file))
+        self.by_certificate = client_cert is not None
+        self._authorization = None
+        if not self.by_certificate:
+            token = base64.b64encode(("%s:%s" % (user, password)).encode("utf-8")).decode("ascii")
+            self._authorization = "Basic " + token
+        self._opener = _opener(tls_context(ca_file, client_cert))
 
     def request(self, method, path, query=None, body=None, tolerate=()):
         """Send one allowed request. Returns (status, parsed JSON or None)."""
@@ -565,7 +610,8 @@ class Indexer:
             url += "?" + urllib.parse.urlencode(query)
         data = None if body is None else json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Authorization", self._authorization)
+        if self._authorization:
+            req.add_header("Authorization", self._authorization)
         req.add_header("User-Agent", USER_AGENT)
         req.add_header("Accept", "application/json")
         if data is not None:
@@ -581,7 +627,7 @@ class Indexer:
                 exc.close()
             if exc.code in tolerate:
                 return exc.code, text
-            raise CollectError(_describe_status(what, exc.code, text))
+            raise CollectError(_describe_status(what, exc.code, text, self.by_certificate))
         except urllib.error.URLError as exc:
             raise CollectError(_describe_unreachable(what, exc.reason))
         except (ssl.SSLError, ssl.CertificateError, socket.timeout, OSError) as exc:
@@ -624,12 +670,15 @@ class Indexer:
                             tolerate=(404,))
 
 
-def _describe_status(what, code, text):
+def _describe_status(what, code, text, by_certificate=False):
     hint = {
         401: " The username or password was not accepted.",
         403: " The account is not permitted to do this; it needs read access to the six index "
              "patterns.",
     }.get(code, "")
+    if by_certificate and code in (401, 403):
+        hint = (" The indexer did not accept its admin certificate (%s) for this request."
+                % INDEXER_ADMIN_CERT)
     return "%s: the indexer answered HTTP %s.%s Response: %s" % (what, code, hint, text)
 
 
@@ -705,44 +754,64 @@ def _total(body):
     return int(total["value"])
 
 
-def survey_pattern(indexer, pattern, log):
-    """Count and mapping for one pattern. Returns (manifest entry, its fields)."""
-    result = {"pattern": pattern, "indices": [], "count_before": None, "snapshot_total": None,
-              "rows_written": 0, "distinct_ids": 0, "count_after": None, "sha256": None,
-              "reconciled": False, "notes": []}
+def survey_pattern(indexer, pattern, log, suffix=None):
+    """Count and mapping for one data set. With suffix, only the index of that name is read and
+    any other index under the pattern is noted with its count. Returns (manifest entry, fields)."""
+    result = {"pattern": pattern, "index": pattern, "indices": [], "other_indices": [],
+              "count_before": None, "snapshot_total": None, "rows_written": 0,
+              "distinct_ids": 0, "count_after": None, "sha256": None, "reconciled": False,
+              "notes": []}
     log("%s: counting documents" % pattern)
-    result["count_before"] = indexer.count(pattern)
     mapping = indexer.mapping(pattern)
-    result["indices"] = sorted(mapping)
+    if suffix is None:
+        result["indices"] = sorted(mapping)
+        result["count_before"] = indexer.count(pattern)
+    else:
+        current = result["index"] = pattern.replace("*", suffix)
+        result["indices"] = [current] if current in mapping else []
+        for name in sorted(n for n in mapping if n != current):
+            try:
+                documents = indexer.count(name)
+            except CollectError as exc:
+                documents = None
+                result["notes"].append("could not count %s: %s" % (name, exc))
+            result["other_indices"].append({"index": name, "documents": documents})
+            log("%s: not read: %s (%s documents), not this manager's current name %r"
+                % (pattern, name, "unknown" if documents is None else documents, suffix))
+        result["count_before"] = indexer.count(current) if result["indices"] else 0
     fields = set()
-    for index_mapping in mapping.values():
-        properties = (index_mapping.get("mappings") or {}).get("properties") or {}
+    for name in result["indices"]:
+        properties = (mapping[name].get("mappings") or {}).get("properties") or {}
         fields.update(leaf_fields(properties))
     log("%s: %d indices, %d fields, %d documents counted" % (
         pattern, len(result["indices"]), len(fields), result["count_before"]))
     return result, fields
 
 
-def export_pattern(indexer, result, fields, columns, entry, page_size, log):
+def export_pattern(indexer, result, fields, columns, entry, page_size, log,
+                   required=REQUIRED_PATTERNS):
     """Append one pattern's documents to the combined CSV and reconcile them."""
-    pattern = result["pattern"]
+    pattern, target = result["pattern"], result["index"]
     if not result["indices"]:
-        result["count_after"] = indexer.count(pattern)
-        if pattern in REQUIRED_PATTERNS:
+        result["count_after"] = indexer.count(pattern) if target == pattern else 0
+        if pattern in required:
             result["notes"].append("no index matches this pattern")
             log("%s: NO INDEX MATCHES THIS PATTERN; nothing to export" % pattern)
         else:
             result["reconciled"] = True
             result["notes"].append("no index matches this pattern; the agents report no such "
-                                   "inventory")
+                                   "inventory, or this Wazuh indexes none (the inventory is in "
+                                   "manager/inventory.json)")
             log("%s: no index matches this pattern; noted" % pattern)
+        if target != pattern:
+            result["notes"].append("no index named %s, the current name" % target)
         return result
     digest = hashlib.sha256()
     ids = set()
     rows = 0
     scroll_id = None
     try:
-        body = indexer.first_page(pattern, page_size)
+        body = indexer.first_page(target, page_size)
         scroll_id = body.get("_scroll_id")
         result["snapshot_total"] = _total(body)
         log("%s: snapshot total %d" % (pattern, result["snapshot_total"]))
@@ -783,7 +852,7 @@ def export_pattern(indexer, result, fields, columns, entry, page_size, log):
                 log("%s: WARNING: could not release the search context; it expires by itself "
                     "after %s: %s" % (pattern, KEEP_ALIVE, exc))
 
-    result["count_after"] = indexer.count(pattern)
+    result["count_after"] = indexer.count(target)
     total = result["snapshot_total"]
     problems = []
     if rows != total:
@@ -804,9 +873,10 @@ def export_pattern(indexer, result, fields, columns, entry, page_size, log):
     return result
 
 
-def collect_indexer(indexer, zf, page_size, manifest, log):
-    """Every document of the six patterns, as one CSV in the Reporting CSV's column form."""
-    surveyed = [survey_pattern(indexer, pattern, log) for _, pattern in PATTERNS]
+def collect_indexer(indexer, zf, page_size, manifest, log, suffix=None,
+                    required=REQUIRED_PATTERNS):
+    """Every document of the six data sets, as one CSV in the Reporting CSV's column form."""
+    surveyed = [survey_pattern(indexer, pattern, log, suffix) for _, pattern in PATTERNS]
     columns = sorted(set().union(*(fields for _, fields in surveyed)))
     header = _csv_line(["_index", "_id"] + [SOURCE_PREFIX + c for c in columns])
     digest = hashlib.sha256(header)
@@ -815,12 +885,14 @@ def collect_indexer(indexer, zf, page_size, manifest, log):
         for result, fields in surveyed:
             manifest["patterns"].append(result)
             export_pattern(indexer, result, fields, columns,
-                           _Tee(entry, digest), page_size, log)
+                           _Tee(entry, digest), page_size, log, required)
+    unreconciled = [r["pattern"] for r, _ in surveyed if not r["reconciled"]]
     manifest["items"].append({"entry": CSV_ENTRY, "columns": len(columns) + 2,
                               "rows": sum(r["rows_written"] for r, _ in surveyed),
                               "sha256": digest.hexdigest(),
-                              "reconciled": all(r["reconciled"] for r, _ in surveyed),
-                              "notes": []})
+                              "reconciled": not unreconciled,
+                              "notes": ["%s did not reconcile; see its entry" % p
+                                        for p in unreconciled]})
 
 
 class _Tee:
@@ -884,6 +956,7 @@ def collect_manager(wazuh_dir, config, version, zf, manifest, log, hostname):
         raise CollectError("listing the agent databases in %s: %s" % (db_dir, exc))
     log("manager: %d agent databases on this node" % len(ids))
     sync, scans, failures = [], [], []
+    inventory, inventory_failures = [], []
     for agent in ids:
         try:
             result, rows = read_table(socket_path, SYNC_COUNT, SYNC_PAGE, "component", log,
@@ -907,12 +980,33 @@ def collect_manager(wazuh_dir, config, version, zf, manifest, log, hostname):
                 scans.append({"agent": agent, "table": table, "error": text})
                 failures.append("agent %s %s: %s" % (agent, table, text))
                 log("manager: agent %s %s: ERROR: %s" % (agent, table, text))
+        for table in INVENTORY_TABLES:
+            try:
+                result, rows = read_table(socket_path, INVENTORY_COUNT, INVENTORY_PAGE, "row_id",
+                                          log, agent=agent, inventory=table)
+                inventory.append({"agent": agent, "table": table, "rows": rows,
+                                  "reconciled": result["reconciled"], "notes": result["notes"]})
+                if not result["reconciled"]:
+                    inventory_failures.append("agent %s %s: %s" % (
+                        agent, table, "; ".join(result["notes"])))
+            except CollectError as exc:
+                inventory.append({"agent": agent, "table": table, "rows": [],
+                                  "reconciled": False, "error": str(exc)})
+                inventory_failures.append("agent %s %s: %s" % (agent, table, exc))
+                log("manager: agent %s %s rows: ERROR: %s" % (agent, table, exc))
+    log("manager: inventory, %d rows from %d tables of %d agents%s" % (
+        sum(len(i["rows"]) for i in inventory), len(INVENTORY_TABLES), len(ids),
+        "" if not inventory_failures else "; DID NOT RECONCILE: "
+        + "; ".join(inventory_failures)))
     _write_json(zf, "manager/sync_info.json", sync, manifest,
                 sum(len(s["rows"]) for s in sync), not any("sync_info" in f for f in failures),
                 [f for f in failures if "sync_info" in f])
     _write_json(zf, "manager/scan_times.json", scans, manifest, len(scans),
                 not any("sync_info" not in f for f in failures),
                 [f for f in failures if "sync_info" not in f])
+    _write_json(zf, "manager/inventory.json", inventory, manifest,
+                sum(len(i["rows"]) for i in inventory), not inventory_failures,
+                inventory_failures)
 
     data = (config["vulnerability_detection"] + "\n").encode("utf-8")
     zf.writestr("manager/vulnerability-detection.conf", data)
@@ -1195,7 +1289,9 @@ def parse_args(argv):
     parser.add_argument("--ca-file", help="the CA certificate the indexer's certificate is "
                                           "issued from (default: the first <ca> in ossec.conf's "
                                           "<indexer>)")
-    parser.add_argument("--user", help="indexer username (asked for if not given)")
+    parser.add_argument("--user", help="an indexer account to read with, its password asked for "
+                                       "at a hidden prompt; only where the indexer's admin "
+                                       "certificate is not on this host")
     parser.add_argument("--out-dir", default=".",
                         help="where to write the package (default: the current directory)")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
@@ -1242,10 +1338,12 @@ def _finish(partial_path, final_path, complete, manifest, log):
     os.remove(partial_path)
 
 
-def setup(args, wazuh_dir, token_given):
-    """Everything decided before anything is written: the role and the indexer to read."""
+def setup(args, wazuh_dir, token_given, hostname, admin_cert):
+    """Everything decided before anything is written: the role, the indexer to read, how to sign
+    in to it, and the name of the indices that are current."""
     socket_path = os.path.join(wazuh_dir, "queue", "db", "wdb")
-    plan = {"manager": os.path.exists(socket_path), "config": None, "url": None, "ca": None}
+    plan = {"manager": os.path.exists(socket_path), "config": None, "url": None, "ca": None,
+            "auth": None, "client_cert": None, "suffix": None, "suffix_note": None}
     if not os.path.isdir(args.out_dir):
         raise UsageError("--out-dir %s is not a directory" % args.out_dir)
     if args.page_size < 1:
@@ -1270,31 +1368,58 @@ def setup(args, wazuh_dir, token_given):
         plan["url"] = check_url(url)
         if not os.path.isfile(ca):
             raise UsageError("the indexer CA file %s is not a readable file" % ca)
-        tls_context(ca)
         plan["ca"] = ca
+        if args.user:
+            plan["auth"] = "account"
+            tls_context(ca)
+        else:
+            missing = [p for p in admin_cert if not os.path.isfile(p)]
+            if missing:
+                raise UsageError(
+                    "the indexer's admin certificate is not on this host (%s not found), so the "
+                    "indexer cannot be read without an account. Nothing was collected or "
+                    "sent%s. If this manager's indexer runs on another host, contact 4am Labs."
+                    % (" and ".join(missing),
+                       ", and the upload token is still unused" if token_given else ""))
+            try:
+                tls_context(ca, admin_cert)
+            except (ssl.SSLError, OSError) as exc:
+                raise UsageError("the indexer's admin certificate %s and key %s cannot be used: "
+                                 "%s" % (admin_cert[0], admin_cert[1], exc))
+            plan["auth"] = "certificate"
+            plan["client_cert"] = tuple(admin_cert)
+        config = plan["config"]
+        if config:
+            name = ((config["cluster"] or {}).get("name") if config["role"] == "master"
+                    else hostname)
+            if name and INDEX_SUFFIX.match(name):
+                plan["suffix"] = name
+            else:
+                plan["suffix_note"] = ("the current index name could not be told (%r), so every "
+                                       "index under each pattern is read" % name)
     return plan
 
 
 def main(argv=None, prompt=getpass.getpass, ask=input, wazuh_dir=WAZUH_DIR,
          upload_url=UPLOAD_URL, upload_ca=None, recipient=None, encrypt=encrypt_package,
-         hostname=None):
+         hostname=None, admin_cert=(INDEXER_ADMIN_CERT, INDEXER_ADMIN_KEY)):
     args = parse_args(argv)
     recipient = RECIPIENT_CERTIFICATE if recipient is None else recipient
+    node = hostname or socket.gethostname()
     try:
         if args.send is not None and not recipient:
             raise UsageError("this copy of the script carries no recipient certificate, so it "
                              "cannot send; ask 4am Labs for the current copy")
-        plan = setup(args, wazuh_dir, args.send is not None)
+        plan = setup(args, wazuh_dir, args.send is not None, node, admin_cert)
     except (UsageError, ssl.SSLError, OSError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return EXIT_ERROR
 
     user = password = None
-    if plan["indexer"]:
-        user = args.user or ask("Indexer username: ").strip()
+    if plan["auth"] == "account":
+        user = args.user
         password = prompt("Password for %s: " % user)
 
-    node = hostname or socket.gethostname()
     started = utc_now()
     stem = os.path.join(args.out_dir, "wazuh-collect-%s-%s" % (
         _safe_name(node), started.strftime("%Y%m%dT%H%M%SZ")))
@@ -1309,12 +1434,21 @@ def main(argv=None, prompt=getpass.getpass, ask=input, wazuh_dir=WAZUH_DIR,
     role = plan["config"]["role"] if plan["config"] else "not a manager"
     manifest = {"script_version": VERSION, "script_sha256": script_sha256(),
                 "started": iso(started), "finished": None, "node": node, "role": role,
-                "indexer": plan["url"], "indexer_version": None, "proxy": None,
+                "indexer": plan["url"], "indexer_auth": plan["auth"],
+                "index_name": plan["suffix"], "indexer_version": None, "proxy": None,
                 "page_size": args.page_size, "result": None, "error": None, "items": [],
                 "patterns": []}
+    if plan["auth"] == "account":
+        auth = "user %s" % user
+    else:
+        auth = "the indexer's admin certificate %s" % (plan["client_cert"] or ("",))[0]
     log("wazuh-collect %s on %s (%s)%s" % (VERSION, node, role, (
-        ", indexer %s, user %s" % (plan["url"], user)) if plan["indexer"] else
+        ", indexer %s, %s" % (plan["url"], auth)) if plan["indexer"] else
         "; a worker node: the indexer is read by the master's run"))
+    if plan["indexer"]:
+        log("indexer indices: %s" % (
+            "those named %s" % plan["suffix"] if plan["suffix"] else
+            plan["suffix_note"] or "every index under each pattern (not a manager)"))
     if not plan["manager"]:
         log("no wazuh-db socket at %s: not a Wazuh manager, so only the indexer is read"
             % os.path.join(wazuh_dir, "queue", "db", "wdb"))
@@ -1329,13 +1463,16 @@ def main(argv=None, prompt=getpass.getpass, ask=input, wazuh_dir=WAZUH_DIR,
                     log("manager: version unknown: %s" % why)
                 collect_manager(wazuh_dir, plan["config"], version, zf, manifest, log, node)
             if plan["indexer"]:
-                indexer = Indexer(plan["url"], plan["ca"], user, password)
+                indexer = Indexer(plan["url"], plan["ca"], user, password,
+                                  client_cert=plan["client_cert"])
                 manifest["proxy"] = proxy_in_use(plan["url"])
                 log("indexer proxy: %s" % (manifest["proxy"] or "none"))
                 found, why = indexer.version()
                 manifest["indexer_version"] = found or "unknown"
                 log("indexer version: %s" % (found or "unknown (%s)" % why))
-                collect_indexer(indexer, zf, args.page_size, manifest, log)
+                collect_indexer(indexer, zf, args.page_size, manifest, log, plan["suffix"],
+                                MANAGER_REQUIRED_PATTERNS if plan["manager"]
+                                else REQUIRED_PATTERNS)
     except CollectError as exc:
         failure = str(exc)
     except KeyboardInterrupt:

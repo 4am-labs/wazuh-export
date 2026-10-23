@@ -214,14 +214,15 @@ class Base(unittest.TestCase):
         os.environ.update(self._saved)
 
     @staticmethod
-    def indexer(cert="localhost", vuln_agents=3, per_agent=40, skip=()):
+    def indexer(cert="localhost", vuln_agents=3, per_agent=40, skip=(), suffix="wazuh"):
         fake = fi.FakeIndexer(CERTS, USER, PASSWORD, cert=cert)
         for pattern in fi.PATTERNS:
             if pattern in skip:
                 continue
             agents = vuln_agents if pattern == fi.VULN_PATTERN else 3
             fake.add_index(pattern, fi.docs_for(pattern, agents, per_agent,
-                                                prefix=pattern.split("-")[2][:4]))
+                                                prefix=pattern.split("-")[2][:4]),
+                           suffix=suffix)
         return fake
 
     @staticmethod
@@ -232,19 +233,22 @@ class Base(unittest.TestCase):
         return fake
 
     def collect(self, extra=(), send=TOKEN, receiver=None, prompt=None, wazuh_dir=None,
-                recipient=RECIPIENT, encrypt=None, upload_ca=None, user=USER):
+                recipient=RECIPIENT, encrypt=None, upload_ca=None, user=USER, admin=None):
+        """One run. admin is the indexer admin certificate pair the run finds on the host;
+        None means none is there."""
         argv = ["--out-dir", self.out, "--page-size", "1000"] + list(extra)
         if user:
             argv += ["--user", user]
         if send:
             argv += ["--send", send]
+        absent = (os.path.join(self.root, "no-admin.pem"), os.path.join(self.root, "no-admin.key"))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = WC.main(argv, prompt=prompt or (lambda _: PASSWORD), ask=lambda _: USER,
                            wazuh_dir=self.root if wazuh_dir is None else wazuh_dir,
                            upload_url=receiver.url if receiver else "https://localhost:1/v1/upload",
                            upload_ca=upload_ca or CERTS["ca"], recipient=recipient,
-                           encrypt=encrypt or ENCRYPT, hostname=NODE)
+                           encrypt=encrypt or ENCRYPT, hostname=NODE, admin_cert=admin or absent)
         return Run(code, self.out, err.getvalue())
 
     def assertNoSecret(self, run, extra=()):
@@ -307,10 +311,28 @@ class MasterRun(Base):
 
     def test_zip_entries(self):
         self.assertEqual(sorted(self.done.entries()), [
-            "collect.log", "manager/agents.json", "manager/node.json",
+            "collect.log", "manager/agents.json", "manager/inventory.json", "manager/node.json",
             "manager/scan_times.json", "manager/sync_info.json",
             "manager/vulnerability-detection.conf", "manager/vulnerability-scanner.log",
             "manifest.json", "wazuh-states.csv"])
+
+    def test_inventory_rows_whole_per_agent(self):
+        # Wazuh before 4.13 puts no inventory in the indexer; wazuh-db holds it.
+        inventory = self.done.json("manager/inventory.json")
+        self.assertEqual(len(inventory), 3 * len(WC.INVENTORY_TABLES))
+        self.assertEqual({(i["agent"], i["table"]) for i in inventory},
+                         {(a, t) for a in ("001", "002", "003") for t in WC.INVENTORY_TABLES})
+        programs = next(i for i in inventory if i["agent"] == "002"
+                        and i["table"] == "sys_programs")
+        self.assertEqual([r["name"] for r in programs["rows"]], ["pkg-0", "pkg-1", "pkg-2"])
+        self.assertTrue(programs["reconciled"])
+        addresses = next(i for i in inventory if i["agent"] == "003"
+                         and i["table"] == "sys_netaddr")
+        self.assertEqual(addresses["rows"][0]["address"], "10.0.0.3")
+        item = next(i for i in self.done.manifest()["items"]
+                    if i["entry"] == "manager/inventory.json")
+        self.assertTrue(item["reconciled"])
+        self.assertEqual(item["rows"], sum(len(i["rows"]) for i in inventory))
 
     def test_every_document_of_six_data_sets_past_ten_thousand(self):
         rows = self.done.rows()
@@ -396,7 +418,12 @@ class MasterRun(Base):
         for command in self.wdb.commands:
             WC.check_sql(command)
             self.assertNotIn("internal_key", command)
-            self.assertNotIn("*", command.split(" FROM ")[0].replace("COUNT(*)", ""))
+            select, _, rest = command.partition(" FROM ")
+            if "rowid AS row_id, *" in select:
+                # Every column, of an inventory table only.
+                self.assertIn(rest.split(" ")[0], WC.INVENTORY_TABLES)
+                select = select.replace("rowid AS row_id, *", "")
+            self.assertNotIn("*", select.replace("COUNT(*)", ""))
         for method, path, query, _ in self.fake.requests:
             WC.check_allowed(method, path, query)
 
@@ -456,12 +483,14 @@ class Roles(Base):
         self.assertEqual(run.manifest()["role"], "worker")
 
     def test_cluster_disabled_is_standalone_and_reads_everything(self):
-        with self.indexer() as fake:
+        # With no cluster, Wazuh names the indices after the host.
+        with self.indexer(suffix=NODE) as fake:
             make_manager(self.root, disabled="yes", url=fake.url)
             with fw.FakeWazuhDb(self.root, agents=2):
                 run = self.collect(send=None)
         self.assertEqual(run.code, 0, run.stderr)
         self.assertEqual(run.manifest()["role"], "standalone")
+        self.assertEqual(run.manifest()["index_name"], NODE)
         self.assertIn("manager/agents.json", run.entries())
         self.assertIn("wazuh-states.csv", run.entries())
 
@@ -599,13 +628,32 @@ class WazuhDb(Base):
                         "agent 1 sql SELECT COUNT(*) AS n FROM sync_info",
                         "agent 001 sql SELECT COUNT(*) AS n FROM sync_info; DROP TABLE x",
                         "global sql SELECT COUNT(*) AS n FROM agent ",
-                        WC.GLOBAL_PAGE.format(limit=0, offset=0)):
+                        WC.GLOBAL_PAGE.format(limit=0, offset=0),
+                        WC.INVENTORY_PAGE.format(agent="001", inventory="sys_users", limit=5,
+                                                 offset=0),
+                        WC.INVENTORY_COUNT.format(agent="001", inventory="sys_processes"),
+                        "agent 001 sql SELECT rowid AS row_id, * FROM agent ORDER BY rowid "
+                        "LIMIT 5 OFFSET 0"):
             with self.assertRaises(WC.CollectError, msg=command):
                 WC.check_sql(command)
         for command in (WC.GLOBAL_COUNT, WC.GLOBAL_PAGE.format(limit=200, offset=400),
                         WC.SYNC_PAGE.format(agent="1024", limit=5, offset=0),
-                        WC.SCAN_TIME.format(agent="001", table="sys_netiface")):
+                        WC.SCAN_TIME.format(agent="001", table="sys_netiface"),
+                        WC.INVENTORY_COUNT.format(agent="001", inventory="sys_netproto"),
+                        WC.INVENTORY_PAGE.format(agent="001", inventory="sys_programs",
+                                                 limit=200, offset=0)):
             WC.check_sql(command)
+
+    def test_inventory_rows_missing_do_not_reconcile_but_are_sent(self):
+        with self.master(agents=2) as wdb:
+            wdb.faults["drop_rows_for"] = "agent 002 sql SELECT rowid AS row_id, * FROM sys_programs"
+            with self.receiver() as rx:
+                run = self.run_master(wdb, rx=rx)
+            self.assertEqual(len(rx.received), 1)
+        self.assertEqual(run.code, 1, run.stderr)
+        item = next(i for i in run.manifest()["items"] if i["entry"] == "manager/inventory.json")
+        self.assertFalse(item["reconciled"])
+        self.assertIn("agent 002 sys_programs: 2 rows read but the count is 3", item["notes"][0])
 
     def test_a_refused_statement_never_reaches_the_socket(self):
         with self.master(agents=1) as wdb:
@@ -641,6 +689,9 @@ class IndexerReconciliation(Base):
         self.assertFalse(vuln["reconciled"])
         self.assertEqual(vuln["rows_written"], 0)
         self.assertEqual(len(rx.received), 1)
+        csv_item = next(i for i in run.manifest()["items"] if i["entry"] == "wazuh-states.csv")
+        self.assertEqual(csv_item["notes"],
+                         ["wazuh-states-vulnerabilities-* did not reconcile; see its entry"])
 
     def test_page_served_twice(self):
         with self.indexer(per_agent=500) as fake, self.receiver() as rx:
@@ -688,7 +739,21 @@ class IndexerReconciliation(Base):
         self.assertIn("no index matches this pattern", hotfixes["notes"][0])
 
     def test_required_data_set_with_no_index_is_incomplete(self):
+        run, _, _ = self.collect_with(send=None, skip=("wazuh-states-vulnerabilities-*",))
+        self.assertIncomplete(run)
+
+    def test_no_packages_index_on_a_manager_is_noted_not_incomplete(self):
+        # Wazuh before 4.13 indexes no inventory; on a manager it is read from wazuh-db.
         run, _, _ = self.collect_with(send=None, skip=("wazuh-states-inventory-packages-*",))
+        self.assertEqual(run.code, 0, run.stderr)
+        packages = next(p for p in run.manifest()["patterns"]
+                        if p["pattern"] == "wazuh-states-inventory-packages-*")
+        self.assertTrue(packages["reconciled"])
+        self.assertIn("manager/inventory.json", packages["notes"][0])
+
+    def test_no_packages_index_off_a_manager_is_incomplete(self):
+        with self.indexer(skip=("wazuh-states-inventory-packages-*",)) as fake:
+            run = self.collect(extra=["--url", fake.url, "--ca-file", CERTS["ca"]], send=None)
         self.assertIncomplete(run)
 
     def test_unmapped_field_stops_the_run(self):
@@ -774,7 +839,12 @@ class Refusals(Base):
                                         ("GET", "/wazuh-states-inventory-users-*/_count", {}),
                                         ("POST", "/wazuh-states-vulnerabilities-*/_search", {}),
                                         ("DELETE", "/wazuh-states-vulnerabilities-test", {}),
-                                        ("GET", "/_cat/indices", {})):
+                                        ("GET", "/_cat/indices", {}),
+                                        ("GET", "/wazuh-states-vulnerabilities-a*b/_count", {}),
+                                        ("POST", "/wazuh-states-inventory-users-wazuh/_search",
+                                         {"scroll": "1m"}),
+                                        ("GET", "/wazuh-states-vulnerabilities-wazuh/_mapping",
+                                         {})):
                 with self.assertRaises(WC.CollectError):
                     ix.request(method, path, query)
             self.assertEqual(fake.requests, [])
@@ -796,6 +866,108 @@ class Refusals(Base):
         self.assertTrue(cert.startswith("-----BEGIN CERTIFICATE-----\n"))
         self.assertTrue(cert.endswith("-----END CERTIFICATE-----\n"))
         self.assertEqual(cert.count("BEGIN"), 1)
+
+
+class AdminCertificate(Base):
+    """One command and nothing else: where the indexer runs on the host, its admin certificate
+    signs the script in, with no account and no password."""
+
+    def master_run(self, admin, rx=None, send=None, cert="localhost"):
+        with self.indexer(cert=cert) as fake:
+            make_manager(self.root, url=fake.url)
+            with fw.FakeWazuhDb(self.root, agents=1):
+                run = self.collect(send=send, receiver=rx, user=None, prompt=_not_called,
+                                   admin=admin)
+            return run, fake
+
+    def test_the_admin_certificate_signs_in_with_no_account_or_password(self):
+        with self.receiver() as rx:
+            run, fake = self.master_run(CERTS["admin"], rx=rx, send=TOKEN)
+            self.assertEqual(len(rx.received), 1)
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertTrue(fake.requests)
+        self.assertEqual({r[3] for r in fake.requests}, {None}, "an Authorization header was sent")
+        self.assertEqual(set(fake.client_cns), {"admin"})
+        self.assertEqual(run.manifest()["indexer_auth"], "certificate")
+        self.assertIn("the indexer's admin certificate", run.stderr)
+        with open(CERTS["admin"][1], encoding="ascii") as fh:
+            key_body = fh.read().splitlines()[1]
+        self.assertNoSecret(run, extra=(key_body,))
+
+    def test_no_certificate_and_no_account_stops_before_anything(self):
+        with self.receiver() as rx:
+            run, fake = self.master_run(None, rx=rx, send=TOKEN)
+            self.assertEqual(rx.requests, [])
+            self.assertEqual(rx.state(TOKEN), "unused")
+            self.assertEqual(fake.requests, [])
+        self.assertEqual(run.code, 2)
+        self.assertIn("the indexer's admin certificate is not on this host", run.stderr)
+        self.assertIn("the upload token is still unused", run.stderr)
+        self.assertEqual(run.files, [])
+
+    def test_a_key_that_does_not_load_stops_before_anything(self):
+        bad = os.path.join(self.root, "bad-key.pem")
+        with open(bad, "w") as fh:
+            fh.write("not a key\n")
+        run, fake = self.master_run((CERTS["admin"][0], bad))
+        self.assertEqual(run.code, 2)
+        self.assertIn("cannot be used", run.stderr)
+        self.assertEqual(run.files, [])
+        self.assertEqual(fake.requests, [])
+
+    def test_a_certificate_the_indexer_does_not_trust_is_refused_unsent(self):
+        with self.receiver() as rx:
+            run, fake = self.master_run(CERTS["rogueadmin"], rx=rx, send=TOKEN)
+            self.assertEqual(rx.requests, [])
+            self.assertEqual(rx.state(TOKEN), "unused")
+        self.assertEqual(run.code, 2)
+        self.assertIn("NOT SENT: the run stopped", run.stderr)
+        self.assertNotIn("admin", set(fake.client_cns))
+
+    def test_the_allow_list_binds_the_certificate_too(self):
+        with self.indexer() as fake:
+            ix = WC.Indexer(fake.url, CERTS["ca"], None, None, client_cert=CERTS["admin"])
+            for method, path, query in (("PUT", "/x", {}),
+                                        ("GET", "/_cat/indices", {}),
+                                        ("DELETE", "/wazuh-states-vulnerabilities-wazuh", {}),
+                                        ("GET", "/wazuh-states-inventory-users-*/_count", {})):
+                with self.assertRaises(WC.CollectError):
+                    ix.request(method, path, query)
+            self.assertEqual(fake.requests, [])
+
+
+class IndexNames(Base):
+    """Only the indices of the current name are read; others left by an earlier name are
+    listed, not read."""
+
+    def test_only_the_current_names_index_is_read(self):
+        with self.indexer() as fake:
+            fake.add_index(fi.VULN_PATTERN, fi.docs_for(fi.VULN_PATTERN, 1, 7, prefix="old"),
+                           suffix="ip-10-0-0-1")
+            make_manager(self.root, url=fake.url)
+            with fw.FakeWazuhDb(self.root, agents=1):
+                run = self.collect(send=None)
+            searched = [r[1] for r in fake.requests if r[1].endswith("/_search")]
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual({r[0] for r in run.rows()[1:]},
+                         {fi.index_name(p) for p in fi.PATTERNS})
+        vuln = next(p for p in run.manifest()["patterns"] if p["pattern"] == fi.VULN_PATTERN)
+        self.assertEqual(vuln["other_indices"],
+                         [{"index": "wazuh-states-vulnerabilities-ip-10-0-0-1", "documents": 7}])
+        self.assertFalse([p for p in searched if "ip-10-0-0-1" in p], searched)
+        self.assertEqual(run.manifest()["index_name"], "wazuh")
+
+    def test_no_index_of_the_current_name_is_incomplete_whatever_else_is_there(self):
+        with self.indexer(suffix="ip-10-0-0-1") as fake:
+            make_manager(self.root, url=fake.url)
+            with fw.FakeWazuhDb(self.root, agents=1):
+                run = self.collect(send=None)
+        self.assertEqual(run.code, 1, run.stderr)
+        self.assertRegex(run.zip_path, r"-INCOMPLETE\.zip$")
+        vuln = next(p for p in run.manifest()["patterns"] if p["pattern"] == fi.VULN_PATTERN)
+        self.assertIn("no index named wazuh-states-vulnerabilities-wazuh, the current name",
+                      vuln["notes"])
+        self.assertEqual(len(vuln["other_indices"]), 1)
 
 
 class Upload(Base):

@@ -45,6 +45,12 @@ subjectAltName = {san}
 basicConstraints = critical,CA:FALSE
 keyUsage = critical,keyEncipherment
 subjectKeyIdentifier = hash
+[client]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
 """
 
 
@@ -78,6 +84,19 @@ def make_server_cert(directory, ca_name, name, san):
     return os.path.join(directory, name + ".pem"), os.path.join(directory, name + ".key")
 
 
+def make_client_cert(directory, ca_name, name):
+    """A client certificate issued by CA <ca_name>, CN <name>: <name>.pem, <name>.key."""
+    cnf = os.path.join(directory, name + ".cnf")
+    with open(cnf, "w") as fh:
+        fh.write(CNF.format(cn=name, san="DNS:unused"))
+    _openssl(["req", "-new", "-newkey", "rsa:2048", "-nodes", "-config", cnf,
+              "-keyout", name + ".key", "-out", name + ".csr"], directory)
+    _openssl(["x509", "-req", "-in", name + ".csr", "-CA", ca_name + ".pem", "-CAkey",
+              ca_name + ".key", "-CAcreateserial", "-days", "2", "-extfile", cnf,
+              "-extensions", "client", "-out", name + ".pem"], directory)
+    return os.path.join(directory, name + ".pem"), os.path.join(directory, name + ".key")
+
+
 def make_recipient(directory, name):
     """A self-signed recipient certificate and key for CMS: <name>.pem, <name>.key."""
     cnf = os.path.join(directory, name + ".cnf")
@@ -100,6 +119,9 @@ def make_certs(directory):
         "wronghost": make_server_cert(directory, "ca", "wronghost", "DNS:other.example"),
         "rogue": make_server_cert(directory, "otherca", "rogue", "DNS:localhost,IP:127.0.0.1"),
         "recipient": make_recipient(directory, "recipient"),
+        # The indexer's admin certificate, and one an unrelated CA issued with the same name.
+        "admin": make_client_cert(directory, "ca", "admin"),
+        "rogueadmin": make_client_cert(directory, "otherca", "rogueadmin"),
     }
 
 
@@ -174,7 +196,9 @@ def docs_for(pattern, agents, per_agent, prefix="d"):
     return docs
 
 
-def index_name(pattern, suffix="test"):
+def index_name(pattern, suffix="wazuh"):
+    """A data set's index as Wazuh names it: after the cluster (here "wazuh", as the test
+    managers' clusters are named) or the host."""
     return pattern.replace("*", suffix)
 
 
@@ -205,6 +229,7 @@ class FakeIndexer:
         self.indices = {}            # index name -> (mapping, docs)
         self.faults = Faults()
         self.requests = []           # (method, path, query, authorization header)
+        self.client_cns = []         # the verified client certificate's CN of each, or None
         self.user_agents = []        # the User-Agent header of each request, in order
         self.freed = []
         self.held = threading.Event()   # set once a scroll request is being held
@@ -222,12 +247,16 @@ class FakeIndexer:
         self.server = Server(("127.0.0.1", 0), handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(*certs[cert])
+        # A client certificate is optional; one that is presented must come from the test CA,
+        # and CN "admin" signs in as the indexer's admin, as the real indexer's admin_dn does.
+        context.verify_mode = ssl.CERT_OPTIONAL
+        context.load_verify_locations(certs["ca"])
         self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         self.port = self.server.server_address[1]
         self.url = "https://localhost:%d" % self.port
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
-    def add_index(self, pattern, docs, suffix="test"):
+    def add_index(self, pattern, docs, suffix="wazuh"):
         mapping = {"mappings": FIXTURE["patterns"][pattern]["mappings"]}
         self.indices[index_name(pattern, suffix)] = (mapping, docs)
 
@@ -257,17 +286,26 @@ class FakeIndexer:
         for name in self._matching(pattern):
             for number, doc in enumerate(self.indices[name][1]):
                 source = doc["_source"]
-                if self.faults.extra_field_at == (pattern, number):
+                if self._at(self.faults.extra_field_at, pattern, number):
                     source = dict(source, unmapped_field="x")
-                if self.faults.object_list_at == (pattern, number):
+                if self._at(self.faults.object_list_at, pattern, number):
                     source = dict(source, objects=[{"a": 1}])
                 hits.append({"_index": name, "_id": doc["_id"], "_source": source})
         return hits
 
+    @staticmethod
+    def _at(fault, target, number):
+        """Whether a (pattern, document number) fault applies to this request's document."""
+        return bool(fault) and fnmatch.fnmatchcase(target, fault[0]) and fault[1] == number
+
+    def _faulted(self, target):
+        """Whether the faults apply to a request naming this pattern or index."""
+        return fnmatch.fnmatchcase(target, self.faults.fault_pattern)
+
     def _pages(self, pattern, hits, size):
         pages = [hits[i:i + size] for i in range(0, len(hits), size)]
         f = self.faults
-        if pattern != f.fault_pattern:
+        if not self._faulted(pattern):
             return pages
         if f.replace_page is not None and 0 < f.replace_page < len(pages):
             pages[f.replace_page] = pages[f.replace_page - 1]
@@ -277,14 +315,16 @@ class FakeIndexer:
             del pages[f.drop_page]
         return pages
 
-    def handle(self, method, path, query, headers, body):
-        """Returns (status, payload dict, extra headers)."""
+    def handle(self, method, path, query, headers, body, client_cn=None):
+        """Returns (status, payload dict, extra headers). client_cn is the CN of a verified
+        client certificate, or None."""
         with self._lock:
             self.requests.append((method, path, query, headers.get("Authorization")))
+            self.client_cns.append(client_cn)
             self.user_agents.append(headers.get("User-Agent"))
         expected = "Basic " + base64.b64encode(
             ("%s:%s" % (self.user, self.password)).encode()).decode()
-        if headers.get("Authorization") != expected:
+        if headers.get("Authorization") != expected and client_cn != "admin":
             return 401, {"error": "Unauthorized"}, {}
         for (m, suffix), (code, payload) in self.faults.status.items():
             if m == method and path.endswith(suffix):
@@ -301,7 +341,7 @@ class FakeIndexer:
         if method == "GET" and path.endswith("/_count"):
             count = len(self._hits(pattern))
             if pattern in self._counted:
-                count += self.faults.count_drift if pattern == self.faults.fault_pattern else 0
+                count += self.faults.count_drift if self._faulted(pattern) else 0
             self._counted.add(pattern)
             return 200, {"count": count}, {}
         if method == "POST" and path.endswith("/_search") and "scroll" in query:
@@ -309,9 +349,8 @@ class FakeIndexer:
             pages = self._pages(pattern, hits, body["size"])
             scroll_id = "scroll-%d" % len(self.scrolls)
             self.scrolls[scroll_id] = [pages, 0]
-            offset = self.faults.total_offset if pattern == self.faults.fault_pattern else 0
-            relation = (self.faults.total_relation if pattern == self.faults.fault_pattern
-                        else "eq")
+            offset = self.faults.total_offset if self._faulted(pattern) else 0
+            relation = self.faults.total_relation if self._faulted(pattern) else "eq"
             total = {"value": len(hits) + offset, "relation": relation}
             return 200, self._page(scroll_id, total), {}
         if method == "POST" and path == "/_search/scroll":
@@ -348,8 +387,11 @@ class FakeIndexer:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b""
                 body = json.loads(raw.decode()) if raw else None
+                peer = self.connection.getpeercert() or {}
+                cn = next((v for rdn in peer.get("subject", ()) for k, v in rdn
+                           if k == "commonName"), None)
                 status, payload, extra = fake.handle(self.command, parts.path, query,
-                                                     self.headers, body)
+                                                     self.headers, body, client_cn=cn)
                 data = json.dumps(payload).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")

@@ -9,27 +9,27 @@ The full statement of what it reads, writes, sends and leaves behind is the text
 
 - It only reads. Every wazuh-db statement and every indexer request is checked against a fixed
   list in the script before it is sent, and anything else stops the run first.
-- It never reads an agent's key, the cluster key or the indexer's private key.
-- The indexer password is asked for at a hidden prompt and is never written anywhere.
+- It needs no account and asks for nothing. Where the Wazuh indexer runs on the same host (an
+  all-in-one installation), it signs in with the indexer's own admin certificate, read in place
+  by Python's TLS library and never copied, logged or sent. That certificate permits anything on
+  the indexer, so what the script does with it is only what its fixed list of requests allows.
+- It never reads an agent's key, the cluster key, or the contents of the indexer's private key.
 - It sends one file, the package encrypted to 4am Labs' certificate, to
   `https://upload.4amlabs.com/v1/upload`, and only with the upload token 4am Labs gives you.
 - Everything it makes is left on the host, readable by root only, so you can see what was sent.
-  Its last lines give the command that removes it.
+  Its last line gives the command that removes it.
 
 ## Running it
 
 4am Labs sends you the commit to fetch, the script's SHA-256 and one upload token per manager
-node. On each node, as root:
+node. On each node, from an administrator's shell, this one command:
 
 ```sh
-curl -fsSLo /root/wazuh-collect.py https://raw.githubusercontent.com/4am-labs/wazuh-export/<commit>/wazuh-collect.py \
- && echo '<sha256>  /root/wazuh-collect.py' | sha256sum -c - \
- && /var/ossec/framework/python/bin/python3 -I /root/wazuh-collect.py --user wazuh-collect --out-dir /root --send '<token>'
+sudo bash -c "curl -fsSLo /root/wazuh-collect.py https://raw.githubusercontent.com/4am-labs/wazuh-export/<commit>/wazuh-collect.py && echo '<sha256>  /root/wazuh-collect.py' | sha256sum -c - && /var/ossec/framework/python/bin/python3 -I /root/wazuh-collect.py --out-dir /root --send '<token>'"
 ```
 
 The URL names a commit, so its text cannot change, and the command runs nothing unless the file
-matches the SHA-256. On the master (or a standalone manager) it asks for the indexer password; a
-worker node asks for nothing and sends only its own agents' records.
+matches the SHA-256. A worker node sends only its own agents' records.
 
 Without `--send` the package is made and encrypted on the host and nothing is sent; the `.p7m`
 file can then be returned to 4am Labs another way.
@@ -39,13 +39,16 @@ file can then be returned to 4am Labs another way.
 - A Wazuh manager from 4.8, with the manager's own Python at
   `/var/ossec/framework/python/bin/python3`. On 4.8 and 4.9 it also needs `openssl` on the path,
   to encrypt.
+- On the master or a standalone manager, the indexer on the same host, with its admin certificate
+  at `/etc/wazuh-indexer/certs/admin.pem` and `admin-key.pem`, as Wazuh's installation assistant
+  leaves it. Where the indexer runs on another host, the script stops before reading anything and
+  sends nothing; ask 4am Labs.
 - Outbound HTTPS (TCP 443) to `upload.4amlabs.com`, and to `raw.githubusercontent.com` to fetch
   the script. The master also connects to its indexer.
-- On the master, a read-only indexer user (the command above calls it `wazuh-collect`) whose role
-  has:
-  - cluster permissions `cluster:monitor/main` and `indices:data/read/scroll/clear`;
-  - on the index pattern `wazuh-states-*`: `indices:data/read/search`, `indices:data/read/scroll`
-    and `indices:admin/mappings/get`.
+
+On Wazuh before 4.13 the indexer holds no inventory (packages, network, system, hotfixes,
+hardware), so the script reads it from the manager's own database, which it does on every
+release.
 
 ## Encryption
 
@@ -59,10 +62,12 @@ cipher, AES-128; on 4.8 and 4.9, whose library cannot encrypt CMS, the host's
 
 ## What it was tested on
 
-The whole run, including the upload, was tested on a Wazuh 4.14.8 cluster, master and worker.
-The manager images of 4.8.2, 4.9.2, 4.10.5, 4.11.2, 4.12.0, 4.13.1 and 4.14.9 were checked for the
-bundled Python and its cryptography library, and the encryption on 4.10.5 and 4.8.2 was run in
-those images and decrypted.
+This version was run, without sending, on Ubuntu 22.04 managers installed by Wazuh's
+installation assistant: 4.14.9 (a cluster master and its worker), 4.10.5 and 4.8.2, each signing in
+with the indexer's admin certificate and reading its inventory from the manager's database. The
+previous version's whole run, including the upload, was tested on 4.10.5, 4.8.2 and the 4.14.9
+worker, and on a Wazuh 4.14.8 cluster. The manager images of 4.8.2, 4.9.2, 4.10.5, 4.11.2, 4.12.0, 4.13.1 and 4.14.9
+were checked for the bundled Python and its cryptography library.
 
 ## Checking it yourself
 
