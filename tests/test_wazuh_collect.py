@@ -28,6 +28,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -461,7 +462,13 @@ class MasterRun(Base):
             self.assertEqual(m["script_sha256"], hashlib.sha256(fh.read()).hexdigest())
         for item in m["items"]:
             self.assertTrue(item["reconciled"], item)
-        self.assertIn("to remove what this run left here: rm -- ", self.done.stderr)
+        # The last line removes everything the run left, the script included, with sudo, as the
+        # client command runs it from an administrator's shell.
+        last = self.done.stderr.rstrip("\n").splitlines()[-1]
+        self.assertIn("to remove what this run left here: sudo rm -- ", last)
+        removed = shlex.split(last.split(": sudo rm -- ", 1)[1])
+        self.assertEqual(removed[-1], os.path.abspath(SCRIPT))
+        self.assertEqual(sorted(os.path.basename(p) for p in removed[:-1]), self.done.files)
 
     def test_search_contexts_released(self):
         self.assertEqual(len(self.fake.freed), 6)

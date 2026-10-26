@@ -17,7 +17,7 @@ The full statement of what it reads, writes, sends and leaves behind is the text
 - It sends one file, the package encrypted to 4am Labs' certificate, to
   `https://upload.4amlabs.com/v1/upload`, and only with the upload token 4am Labs gives you.
 - Everything it makes is left on the host, readable by root only, so you can see what was sent.
-  Its last line gives the command that removes it.
+  Its last line gives the command that removes all of it, the downloaded script included.
 
 ## Running it
 
@@ -62,12 +62,14 @@ cipher, AES-128; on 4.8 and 4.9, whose library cannot encrypt CMS, the host's
 
 ## What it was tested on
 
-This version was run, without sending, on Ubuntu 22.04 managers installed by Wazuh's
-installation assistant: 4.14.9 (a cluster master and its worker), 4.10.5 and 4.8.2, each signing in
-with the indexer's admin certificate and reading its inventory from the manager's database. The
-previous version's whole run, including the upload, was tested on 4.10.5, 4.8.2 and the 4.14.9
-worker, and on a Wazuh 4.14.8 cluster. The manager images of 4.8.2, 4.9.2, 4.10.5, 4.11.2, 4.12.0, 4.13.1 and 4.14.9
-were checked for the bundled Python and its cryptography library.
+Version 1.1.0's whole run, from fetching the script by its commit URL to the upload, was tested
+on Ubuntu 22.04 managers installed by Wazuh's installation assistant: 4.14.9 (a cluster master and
+its worker), 4.10.5 and 4.8.2. Each signed in with the indexer's admin certificate, read its
+inventory from the manager's database and sent its package, which was then decrypted and found
+identical to the copy left on the host. Version 1.1.1 changes only the removal command it prints
+last, which the suite checks. Version 1.0.0 was also tested, including the upload, on a Wazuh
+4.14.8 cluster. The manager images of 4.8.2, 4.9.2, 4.10.5, 4.11.2, 4.12.0,
+4.13.1 and 4.14.9 were checked for the bundled Python and its cryptography library.
 
 ## Checking it yourself
 

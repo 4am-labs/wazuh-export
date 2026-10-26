@@ -89,7 +89,8 @@ What it writes, in --out-dir (default: the current directory), each file readabl
     wazuh-collect-<node>-<time>.log        the whole run's log, including the upload
 
 Nothing is deleted afterwards, so that what was sent can be checked. The last lines printed give
-each file's path and SHA-256 and the command that removes them.
+each file's path and SHA-256 and the command that removes them and this script (`sudo rm -- ...`,
+since the files are root's and the client command runs as an administrator through sudo).
 
 What it sends
 -------------
@@ -161,7 +162,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 # Sent with every request. Cloudflare, in front of the receiver, refuses urllib's default.
 USER_AGENT = "wazuh-collect/" + VERSION
 
@@ -1518,7 +1519,10 @@ def main(argv=None, prompt=getpass.getpass, ask=input, wazuh_dir=WAZUH_DIR,
         except KeyboardInterrupt:
             log("ERROR: interrupted before the upload finished")
             code = EXIT_ERROR
-    log("to remove what this run left here: rm -- %s" % " ".join(shlex.quote(p) for p in left))
+    # With sudo, as the client command runs this from an administrator's shell; the files are
+    # root's. The script itself goes too: the command downloaded it beside them.
+    log("to remove what this run left here: sudo rm -- %s"
+        % " ".join(shlex.quote(p) for p in left + [os.path.abspath(__file__)]))
     log.close()
     return code
 
